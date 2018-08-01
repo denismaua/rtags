@@ -214,10 +214,10 @@ void CompletionThread::process(Request *request)
 
     assert(!cache->translationUnit || cache->source == request->source);
     if (!cache->translationUnit) {
-        cache->source = request->source;
+        cache->source = std::move(request->source);
     }
 
-    const Path sourceFile = request->source.sourceFile();
+    const Path sourceFile = cache->source.sourceFile();
     CXUnsavedFile unsaved = {
         sourceFile.constData(),
         request->unsaved.constData(),
@@ -240,7 +240,7 @@ void CompletionThread::process(Request *request)
             }
             request->conn.reset();
         }
-        LOG() << "No translationUnit for" << request->source.sourceFile() << "recreating";
+        LOG() << "No translationUnit for" << cache->source.sourceFile() << "recreating";
         sw.restart();
         Flags<CXTranslationUnit_Flags> flags = static_cast<CXTranslationUnit_Flags>(clang_defaultEditingTranslationUnitOptions());
         flags |= CXTranslationUnit_CacheCompletionResults;
@@ -252,19 +252,19 @@ void CompletionThread::process(Request *request)
         flags |= CXTranslationUnit_CreatePreambleOnFirstParse;
 #endif
         for (const auto &inc : options.includePaths) {
-            request->source.includePaths << inc;
+            cache->source.includePaths << inc;
         }
-        request->source.defines << options.defines;
+        cache->source.defines << options.defines;
 
         cache->translationUnit = RTags::TranslationUnit::create(sourceFile,
-                                                                request->source.toCommandLine(Source::Default|Source::ExcludeDefaultArguments),
+                                                                cache->source.toCommandLine(Source::Default|Source::ExcludeDefaultArguments),
                                                                 &unsaved, request->unsaved.size() ? 1 : 0, flags, true);
         // error() << "PARSING" << clangLine;
         parseTime = cache->parseTime = sw.elapsed();
         // with clang 3.8 it definitely seems like we have to reparse once to
         // generate the preamble. Even with CXTranslationUnit_CreatePreambleOnFirstParse
         if (!cache->translationUnit) {
-            LOG() << "Failed to parse translation unit" << request->source.sourceFile();
+            LOG() << "Failed to parse translation unit" << cache->source.sourceFile();
             return;
         }
         reparse = true;
@@ -272,7 +272,7 @@ void CompletionThread::process(Request *request)
         reparse = request->unsaved != cache->unsaved;
         cache->lastModified = 0;
     } else {
-        const uint64_t lastModified = request->source.sourceFile().lastModifiedMs();
+        const uint64_t lastModified = cache->source.sourceFile().lastModifiedMs();
         if (lastModified != cache->lastModified) {
             cache->lastModified = lastModified;
             cache->unsaved.clear();
@@ -289,7 +289,7 @@ void CompletionThread::process(Request *request)
     if (reparse) {
         sw.restart();
         assert(cache->translationUnit);
-        LOG() << "reparsing translation unit" << request->source.sourceFile();
+        LOG() << "reparsing translation unit" << cache->source.sourceFile();
         cache->translationUnit->reparse(&unsaved, request->unsaved.size() ? 1 : 0);
         reparseTime = cache->reparseTime = sw.elapsed();
         cache->unsaved = std::move(request->unsaved);
@@ -297,7 +297,10 @@ void CompletionThread::process(Request *request)
 
 
     if (request->flags & WarmUp) {
-        LOG() << "Warmed up unit" << request->source.sourceFile();
+        LOG() << "Warmed up unit" << cache->source.sourceFile();
+        return;
+    } else if (request->flags & Diagnose) {
+        processDiagnostics(request, 0, cache->translationUnit->unit);
         return;
     }
 
@@ -607,7 +610,7 @@ void CompletionThread::printCompletions(const List<std::unique_ptr<MatchResult> 
     }
 }
 
-bool CompletionThread::isCached(uint32_t fileId, const std::shared_ptr<Project> &project) const
+bool CompletionThread::isCached(const std::shared_ptr<Project> &project, uint32_t fileId) const
 {
     std::unique_lock<std::mutex> lock(mMutex);
     for (SourceFile *file : mCacheList) {
@@ -617,6 +620,32 @@ bool CompletionThread::isCached(uint32_t fileId, const std::shared_ptr<Project> 
     return false;
 }
 
+void CompletionThread::reparse(const std::shared_ptr<Project> &project, uint32_t fileId)
+{
+    std::unique_lock<std::mutex> lock(mMutex);
+    Source source;
+    for (SourceFile *file : mCacheList) {
+        if (file->source.fileId == fileId || project->dependsOn(file->source.fileId, fileId)) {
+            source = file->source;
+            break;
+        }
+    }
+    if (!source.isValid())
+        return;
+
+    for (auto req : mPending) {
+        if (req->source == source) {
+            return;
+        }
+    }
+
+    if (Server::instance()->options().options & Server::CompletionLogs)
+        error() << "CODE COMPLETION reparse" << Rct::currentTimeString() << source.sourceFile();
+
+    Request *request = new Request({ std::forward<Source>(source), Location(), Diagnose, String(), String(), std::shared_ptr<Connection>() });
+    mPending.push_back(request);
+    mCondition.notify_one();
+}
 
 String CompletionThread::Request::toString() const
 {
@@ -679,6 +708,39 @@ Source CompletionThread::findSource(const Set<uint32_t> &deps) const
     }
     return Source();
 }
+
+class TranslationUnitDiagnostics : public RTags::DiagnosticsProvider
+{
+public:
+    TranslationUnitDiagnostics(uint32_t sourceFileId, CXTranslationUnit unit)
+        : mSourceFileId(sourceFileId), mUnit(unit)
+    {}
+    virtual size_t unitCount() const override { return 1; }
+    virtual size_t diagnosticCount(size_t) const override { return clang_getNumDiagnostics(mUnit); }
+    virtual CXDiagnostic diagnostic(size_t, size_t idx) const override
+    {
+        return clang_getDiagnostic(mUnit, idx);
+    }
+    virtual Location createLocation(const Path &file, unsigned int line, unsigned int col, bool *blocked = 0) override
+    {
+        if (blocked)
+            *blocked = false;
+        return Location(Location::insertFile(file), line, col);
+    }
+    virtual uint32_t sourceFileId() const override
+    {
+        return mSourceFileId;
+    }
+    virtual IndexDataMessage &indexDataMessage() override
+    {
+        return mIndexDataMessage;
+    }
+    virtual CXTranslationUnit unit(size_t) const override { return mUnit; }
+private:
+    uint32_t mSourceFileId;
+    CXTranslationUnit mUnit;
+    IndexDataMessage mIndexDataMessage;
+};
 
 class CompletionDiagnostics : public RTags::DiagnosticsProvider
 {
@@ -743,11 +805,20 @@ void CompletionThread::processDiagnostics(const Request *request, CXCodeComplete
     if (!project->hasSource(sourceFileId)) {
         return;
     }
-    LOG() << "processing diagnostics" << clang_codeCompleteGetNumDiagnostics(results)
-          << clang_getNumDiagnostics(unit) << request->location << Location::path(request->source.fileId);
-    CompletionDiagnostics diag(sourceFileId, request->location.fileId(), results, unit);
-    diag.diagnose();
-    // error() << "got diagnostics" << diag.indexDataMessage().diagnostics().size();
     Project::FileMapScopeScope scope(project);
-    project->updateDiagnostics(sourceFileId, diag.indexDataMessage().diagnostics());
+    if (results) {
+        LOG() << "processing diagnostics" << clang_codeCompleteGetNumDiagnostics(results)
+              << clang_getNumDiagnostics(unit) << request->location << Location::path(request->source.fileId);
+        CompletionDiagnostics diag(sourceFileId, request->location.fileId(), results, unit);
+        diag.diagnose();
+        // error() << "got diagnostics" << diag.indexDataMessage().diagnostics().size();
+        project->updateDiagnostics(sourceFileId, diag.indexDataMessage().diagnostics());
+    } else {
+        TranslationUnitDiagnostics diag(sourceFileId, unit);
+        LOG() << "processing diagnostics from translation unit" << diag.diagnosticCount(0)
+              << Location::path(request->source.fileId);
+        diag.diagnose();
+        project->updateDiagnostics(sourceFileId, diag.indexDataMessage().diagnostics());
+    }
 }
+

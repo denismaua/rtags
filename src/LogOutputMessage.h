@@ -17,32 +17,35 @@
 #define OutputMessage_h
 
 #include "RTagsMessage.h"
+#include "QueryMessage.h"
 
 class LogOutputMessage : public RTagsMessage
 {
 public:
     enum { MessageId = LogOutputId };
 
-    LogOutputMessage(LogLevel level = LogLevel::Error, unsigned long long flags = 0)
+    LogOutputMessage(LogLevel level = LogLevel::Error, Flags<QueryMessage::Flag> flags = NullFlags)
         : RTagsMessage(MessageId), mLevel(level), mFlags(flags)
     {
     }
 
     LogLevel level() const { return mLevel; }
-    unsigned long long flags() const { return mFlags; }
+    Flags<QueryMessage::Flag> flags() const { return mFlags; }
 
     void encode(Serializer &serializer) const
     {
-        serializer << mCommandLine << mLevel << mFlags;
+        serializer << mCommandLine << mLevel << mFlags.cast<unsigned long long>();
     }
 
     void decode(Deserializer &deserializer)
     {
-        deserializer >> mCommandLine >> mLevel >> mFlags;
+        unsigned long long flags;
+        deserializer >> mCommandLine >> mLevel >> flags;
+        mFlags = Flags<QueryMessage::Flag>::construct(flags);
     }
 private:
     LogLevel mLevel;
-    unsigned long long mFlags;
+    Flags<QueryMessage::Flag> mFlags;
 };
 
 #endif

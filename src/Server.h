@@ -145,6 +145,7 @@ public:
     };
 
     void filterBlockedArguments(Source &source);
+    void sourceFileModified(const std::shared_ptr<Project> &project, uint32_t fileId);
 private:
     String guessArguments(const String &args, const Path &pwd, const Path &projectRootOverride) const;
     bool load();

@@ -937,22 +937,24 @@ void Project::index(const std::shared_ptr<IndexerJob> &job)
 
 void Project::onFileModified(const Path &path)
 {
-    debug() << path << "was modified";
-    onFileAddedOrModified(path);
+    const uint32_t fileId = Location::fileId(path);
+    debug() << path << fileId << "was modified";
+    if (fileId) {
+        onFileAddedOrModified(path, fileId);
+        Server::instance()->sourceFileModified(shared_from_this(), fileId);
+    }
 }
 
 void Project::onFileAdded(const Path &path)
 {
-    debug() << path << "was added";
-    onFileAddedOrModified(path);
+    const uint32_t fileId = Location::fileId(path);
+    debug() << path << fileId << "was added";
+    if (fileId)
+        onFileAddedOrModified(path, fileId);
 }
 
-void Project::onFileAddedOrModified(const Path &file)
+void Project::onFileAddedOrModified(const Path &file, uint32_t fileId)
 {
-    const uint32_t fileId = Location::fileId(file);
-    debug() << file << "was modified" << fileId;
-    if (!fileId)
-        return;
     // error() << file.fileName() << mCompileCommandsInfos.dir << file;
     if (mIndexParseData.compileCommands.contains(fileId)) {
         mReloadCompileCommandsTimer.restart(ReloadCompileCommandsTimeout, Timer::SingleShot);

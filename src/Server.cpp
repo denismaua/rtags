@@ -2525,6 +2525,15 @@ bool Server::runTests()
     return ret;
 }
 
+void Server::sourceFileModified(const std::shared_ptr<Project> &project, uint32_t fileId)
+{
+    // error() << Location::path(fileId) << "modified" << (mCompletionThread ? (mCompletionThread->isCached(project, fileId) ? 1 : 0) : -1);
+    if (mCompletionThread && mCompletionThread->isCached(project, fileId)) {
+        mCompletionThread->reparse(project, fileId);
+
+    }
+}
+
 void Server::prepareCompletion(const std::shared_ptr<QueryMessage> &query, uint32_t fileId, const std::shared_ptr<Project> &project)
 {
     if (query->flags() & QueryMessage::CodeCompletionEnabled && !mCompletionThread) {
@@ -2533,7 +2542,7 @@ void Server::prepareCompletion(const std::shared_ptr<QueryMessage> &query, uint3
     }
 
     if (mCompletionThread && fileId) {
-        if (!mCompletionThread->isCached(fileId, project)) {
+        if (!mCompletionThread->isCached(project, fileId)) {
             Source source = project->source(fileId, query->buildIndex());
             if (source.isNull()) {
                 for (const uint32_t dep : project->dependencies(fileId, Project::DependsOnArg)) {
